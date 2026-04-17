@@ -14,6 +14,9 @@ CORS(app)
 
 # Configuración de la base de datos
 DATABASE = os.path.join(app.root_path, 'agroia.db')
+ALERTA_COOLDOWN_MINUTES = max(1, int(os.getenv('ALERTA_COOLDOWN_MINUTES', '2')))
+REPORT_RECENT_READINGS_LIMIT = max(1, int(os.getenv('REPORT_RECENT_READINGS_LIMIT', '5')))
+REPORT_RECENT_ALERTS_LIMIT = max(1, int(os.getenv('REPORT_RECENT_ALERTS_LIMIT', '3')))
 
 @app.route('/', methods=['GET'])
 def home():
@@ -36,6 +39,32 @@ def init_db():
             db.commit()
         finally:
             db.close()
+
+def ensure_indexes():
+    """Crear indices seguros para acelerar consultas frecuentes."""
+    db = get_db()
+    try:
+        db.executescript("""
+            CREATE INDEX IF NOT EXISTS idx_cultivos_sensor_activo
+            ON cultivos(sensor_id, activo);
+
+            CREATE INDEX IF NOT EXISTS idx_cultivos_usuario_activo
+            ON cultivos(usuario_id, activo);
+
+            CREATE INDEX IF NOT EXISTS idx_lecturas_cultivo_fecha
+            ON lecturas(cultivo_id, fecha DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_alertas_cultivo_resuelta_fecha
+            ON alertas(cultivo_id, resuelta, fecha DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_alertas_fecha
+            ON alertas(fecha DESC);
+        """)
+        db.commit()
+    except sqlite3.Error as e:
+        print(f"No se pudieron crear indices SQLite: {e}")
+    finally:
+        db.close()
 
 def ensure_db_ready():
     """Crear la base de datos si aun no tiene el esquema principal."""
@@ -415,8 +444,9 @@ def crear_alerta_si_necesario(db, cultivo_id, humedad, umbral_min, umbral_max):
     alerta_reciente = db.execute('''
         SELECT id FROM alertas 
         WHERE cultivo_id = ? AND resuelta = 0 
-        AND fecha > datetime('now', '-30 minutes')
-    ''', (cultivo_id,)).fetchone()
+        AND fecha > datetime('now', ?)
+        LIMIT 1
+    ''', (cultivo_id, f'-{ALERTA_COOLDOWN_MINUTES} minutes')).fetchone()
     
     if alerta_reciente:
         return  # Ya hay una alerta activa
@@ -580,6 +610,207 @@ def generar_observaciones_reporte(cultivo, promedio_humedad, total_alertas):
 
     return observaciones[:3]
 
+def generar_recomendaciones_locales_reporte(cultivo, promedio_humedad, total_alertas):
+    """Generar recomendaciones de respaldo cuando la IA no este disponible."""
+    humedad_actual = float(cultivo['humedad'] or 0)
+    umbral_min = float(cultivo['umbral_min'] or 0)
+    umbral_max = float(cultivo['umbral_max'] or 0)
+    recomendaciones = []
+
+    if humedad_actual < umbral_min:
+        recomendaciones.append({
+            'titulo': 'Ajustar riego',
+            'descripcion': 'La humedad actual esta por debajo del umbral. Conviene aumentar la frecuencia de riego y revisar el caudal.',
+            'prioridad': 'alta',
+            'categoria': 'riego'
+        })
+    elif humedad_actual > umbral_max:
+        recomendaciones.append({
+            'titulo': 'Reducir exceso de humedad',
+            'descripcion': 'La humedad supera el rango recomendado. Revisa drenaje, ventilacion y volumen de riego aplicado.',
+            'prioridad': 'alta',
+            'categoria': 'sanidad'
+        })
+    else:
+        recomendaciones.append({
+            'titulo': 'Mantener manejo actual',
+            'descripcion': 'La humedad se mantiene estable. Continua con el manejo actual y monitorea cambios bruscos.',
+            'prioridad': 'media',
+            'categoria': 'monitoreo'
+        })
+
+    if promedio_humedad is not None and promedio_humedad < umbral_min:
+        recomendaciones.append({
+            'titulo': 'Revisar frecuencia de riego',
+            'descripcion': 'El promedio reciente de humedad tambien se mantiene bajo, lo que sugiere ajustar tiempos o frecuencia de riego.',
+            'prioridad': 'media',
+            'categoria': 'riego'
+        })
+    elif promedio_humedad is not None and promedio_humedad > umbral_max:
+        recomendaciones.append({
+            'titulo': 'Evaluar drenaje del suelo',
+            'descripcion': 'El promedio reciente es alto. Conviene revisar drenaje, compactacion y ventilacion para evitar enfermedades.',
+            'prioridad': 'media',
+            'categoria': 'suelo'
+        })
+
+    if total_alertas > 0:
+        recomendaciones.append({
+            'titulo': 'Atender alertas recurrentes',
+            'descripcion': 'Se han registrado alertas en este cultivo. Identifica si provienen de riego irregular, drenaje o condiciones ambientales.',
+            'prioridad': 'alta' if total_alertas >= 3 else 'media',
+            'categoria': 'alertas'
+        })
+
+    return recomendaciones[:4]
+
+def construir_analisis_local_reporte(cultivo, metricas, alertas_recientes):
+    """Analisis local para que el reporte no dependa totalmente de OpenAI."""
+    humedad_actual = float(cultivo['humedad'] or 0)
+    temperatura_actual = float(cultivo['temperatura'] or 0)
+    promedio_humedad = metricas.get('humedad_promedio')
+    estado_humedad = obtener_estado_humedad(
+        humedad_actual,
+        float(cultivo['umbral_min'] or 0),
+        float(cultivo['umbral_max'] or 0)
+    )
+
+    if estado_humedad == 'baja':
+        resumen = 'El cultivo presenta un nivel de humedad por debajo del rango esperado y requiere seguimiento cercano.'
+    elif estado_humedad == 'alta':
+        resumen = 'El cultivo presenta exceso de humedad y existe riesgo de problemas sanitarios si la condicion persiste.'
+    else:
+        resumen = 'El cultivo mantiene un comportamiento estable de humedad dentro del rango esperado.'
+
+    hallazgos = [
+        f"Humedad actual: {humedad_actual}%",
+        f"Temperatura actual: {temperatura_actual} C",
+        f"Total de lecturas registradas: {int(metricas.get('total_lecturas') or 0)}"
+    ]
+
+    if promedio_humedad is not None:
+        hallazgos.append(f"Humedad promedio historica: {promedio_humedad}%")
+
+    riesgos = [a['mensaje'] for a in alertas_recientes[:3]] if alertas_recientes else ['Sin alertas recientes registradas.']
+
+    return {
+        'resumen_ejecutivo': resumen,
+        'hallazgos_clave': hallazgos[:4],
+        'riesgos_principales': riesgos[:3]
+    }
+
+def limpiar_json_respuesta(texto_respuesta):
+    """Intentar convertir respuestas de IA a JSON util."""
+    if not texto_respuesta:
+        raise ValueError('Respuesta vacia de IA')
+
+    texto_limpio = texto_respuesta.strip()
+    texto_limpio = texto_limpio.replace('```json', '').replace('```', '').strip()
+    return json.loads(texto_limpio)
+
+def generar_analisis_ia_reporte(reporte):
+    """Complementar el reporte con analisis y recomendaciones generadas por IA."""
+    cultivo = reporte['cultivo']
+    resumen = reporte['resumen']
+    metricas = reporte['metricas']
+    lecturas = reporte['lecturas_recientes']
+    alertas = reporte['alertas_recientes']
+
+    analisis_local = construir_analisis_local_reporte(cultivo, metricas, alertas)
+    recomendaciones_locales = generar_recomendaciones_locales_reporte(
+        {
+            'humedad': resumen['humedad_actual'],
+            'temperatura': resumen['temperatura_actual'],
+            'umbral_min': cultivo.get('umbral_min', 0),
+            'umbral_max': cultivo.get('umbral_max', 0)
+        },
+        metricas.get('humedad_promedio'),
+        metricas.get('total_alertas', 0)
+    )
+
+    if not openai_client:
+        return {
+            'fuente': 'local',
+            'analisis': analisis_local,
+            'recomendaciones': recomendaciones_locales
+        }
+
+    lecturas_texto = "\n".join(
+        [f"- {l['fecha']}: humedad {l['humedad']}%, temperatura {l['temperatura']} C" for l in lecturas]
+    ) or "- Sin lecturas recientes"
+    alertas_texto = "\n".join(
+        [f"- {a['fecha']}: {a['tipo_alerta']} ({a['nivel']}) - {a['mensaje']}" for a in alertas]
+    ) or "- Sin alertas recientes"
+
+    prompt = f"""Eres un agronomo experto y analista tecnico.
+
+Genera un complemento para un reporte agricola en formato JSON valido.
+
+DATOS DEL CULTIVO:
+- Nombre: {cultivo['nombre']}
+- Tipo: {cultivo['tipo_cultivo']}
+- Etapa: {cultivo['etapa']}
+- Fecha de siembra: {cultivo['fecha_siembra']}
+- Humedad actual: {resumen['humedad_actual']}%
+- Temperatura actual: {resumen['temperatura_actual']} C
+- Rango recomendado de humedad: {resumen['rango_humedad_recomendado']}
+- Estado de humedad: {resumen['estado_humedad']}
+- Total de lecturas: {metricas['total_lecturas']}
+- Humedad promedio: {metricas['humedad_promedio']}
+- Humedad minima: {metricas['humedad_minima']}
+- Humedad maxima: {metricas['humedad_maxima']}
+- Temperatura promedio: {metricas['temperatura_promedio']}
+- Total de alertas: {metricas['total_alertas']}
+
+LECTURAS RECIENTES:
+{lecturas_texto}
+
+ALERTAS RECIENTES:
+{alertas_texto}
+
+Devuelve SOLO un JSON con esta estructura exacta:
+{{
+  "analisis": {{
+    "resumen_ejecutivo": "texto breve",
+    "hallazgos_clave": ["hallazgo 1", "hallazgo 2", "hallazgo 3"],
+    "riesgos_principales": ["riesgo 1", "riesgo 2"]
+  }},
+  "recomendaciones": [
+    {{
+      "titulo": "titulo corto",
+      "descripcion": "accion concreta y util",
+      "prioridad": "alta",
+      "categoria": "riego"
+    }}
+  ]
+}}
+
+Reglas:
+- Responde en espanol.
+- Maximo 3 hallazgos clave.
+- Maximo 4 recomendaciones.
+- Las recomendaciones deben ser concretas, accionables y coherentes con los datos.
+"""
+
+    try:
+        texto_respuesta = generar_respuesta_openai(modelo=OPENAI_TEXT_MODEL, prompt=prompt)
+        resultado = limpiar_json_respuesta(texto_respuesta)
+        analisis = resultado.get('analisis') or analisis_local
+        recomendaciones = resultado.get('recomendaciones') or recomendaciones_locales
+
+        return {
+            'fuente': 'openai',
+            'analisis': analisis,
+            'recomendaciones': recomendaciones[:4]
+        }
+    except Exception as e:
+        print(f"Error al enriquecer reporte con IA: {e}")
+        return {
+            'fuente': 'local',
+            'analisis': analisis_local,
+            'recomendaciones': recomendaciones_locales
+        }
+
 def construir_reporte_cultivo(db, cultivo):
     """Construir un reporte breve y legible para el frontend."""
     cultivo_id = cultivo['id']
@@ -589,8 +820,8 @@ def construir_reporte_cultivo(db, cultivo):
         FROM lecturas
         WHERE cultivo_id = ?
         ORDER BY fecha DESC
-        LIMIT 10
-    ''', (cultivo_id,)).fetchall()
+        LIMIT ?
+    ''', (cultivo_id, REPORT_RECENT_READINGS_LIMIT)).fetchall()
 
     metricas = db.execute('''
         SELECT
@@ -608,8 +839,8 @@ def construir_reporte_cultivo(db, cultivo):
         FROM alertas
         WHERE cultivo_id = ?
         ORDER BY fecha DESC
-        LIMIT 3
-    ''', (cultivo_id,)).fetchall()
+        LIMIT ?
+    ''', (cultivo_id, REPORT_RECENT_ALERTS_LIMIT)).fetchall()
 
     total_alertas = db.execute(
         'SELECT COUNT(*) as total FROM alertas WHERE cultivo_id = ?',
@@ -619,14 +850,16 @@ def construir_reporte_cultivo(db, cultivo):
     promedio_humedad = metricas['promedio_humedad']
     promedio_temperatura = metricas['promedio_temperatura']
 
-    return {
+    reporte = {
         'cultivo': {
             'id': cultivo['id'],
             'nombre': cultivo['nombre'],
             'tipo_cultivo': cultivo['tipo_cultivo'],
             'etapa': cultivo['etapa'],
             'propietario': cultivo['nombre_usuario'],
-            'fecha_siembra': cultivo['fecha_siembra']
+            'fecha_siembra': cultivo['fecha_siembra'],
+            'umbral_min': float(cultivo['umbral_min'] or 0),
+            'umbral_max': float(cultivo['umbral_max'] or 0)
         },
         'resumen': {
             'fecha_generacion': datetime.now().isoformat(),
@@ -647,7 +880,7 @@ def construir_reporte_cultivo(db, cultivo):
             'temperatura_promedio': round(promedio_temperatura, 1) if promedio_temperatura is not None else None,
             'total_alertas': int(total_alertas or 0)
         },
-        'lecturas_recientes': [dict(l) for l in lecturas[:5]],
+        'lecturas_recientes': [dict(l) for l in lecturas],
         'alertas_recientes': [dict(a) for a in alertas],
         'observaciones': generar_observaciones_reporte(
             cultivo,
@@ -656,6 +889,13 @@ def construir_reporte_cultivo(db, cultivo):
         )
     }
 
+    complemento_ia = generar_analisis_ia_reporte(reporte)
+    reporte['analisis_complementario'] = complemento_ia['analisis']
+    reporte['recomendaciones'] = complemento_ia['recomendaciones']
+    reporte['fuente_analisis'] = complemento_ia['fuente']
+
+    return reporte
+
 @app.route('/api/reportes/<int:cultivo_id>', methods=['GET'])
 @app.route('/api/cultivos/<int:cultivo_id>/reporte', methods=['GET'])
 @requiere_auth
@@ -663,13 +903,12 @@ def generar_reporte_cultivo(cultivo_id):
     """Generar reporte simple de un cultivo."""
     usuario_id = request.headers.get('X-Usuario-ID')
     db = get_db()
-
-    cultivo, error = verificar_acceso_cultivo(db, usuario_id, cultivo_id)
-    if error:
-        mensaje, codigo = error
-        return jsonify({'error': mensaje}), codigo
-
     try:
+        cultivo, error = verificar_acceso_cultivo(db, usuario_id, cultivo_id)
+        if error:
+            mensaje, codigo = error
+            return jsonify({'error': mensaje}), codigo
+
         reporte = construir_reporte_cultivo(db, cultivo)
         return jsonify({
             'success': True,
@@ -677,6 +916,8 @@ def generar_reporte_cultivo(cultivo_id):
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
 
 # ========================================
 # RUTA DE SALUD DEL SERVIDOR
@@ -994,7 +1235,6 @@ INSTRUCCIONES:
 @app.route('/api/ia/recomendaciones/<int:cultivo_id>', methods=['GET'])
 def recomendaciones_ia(cultivo_id):
     try:
-        ensure_db_ready()
         db = get_db()
         
         cultivo = db.execute(
@@ -1059,18 +1299,12 @@ Genera 3-5 recomendaciones específicas en formato JSON:
             'timestamp': datetime.now().isoformat()
         })
         
-    except sqlite3.Error as e:
-        print(f"Error de base de datos en recomendaciones IA: {e}")
-        return jsonify({
-            'error': 'Error de base de datos al generar recomendaciones',
-            'detalle': str(e),
-            'tipo': 'database_error'
-        }), 500
     except Exception as e:
         print(f"Error en recomendaciones IA: {e}")
         return construir_error_openai(e, 'generar recomendaciones')
 
 ensure_db_ready()
+ensure_indexes()
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
