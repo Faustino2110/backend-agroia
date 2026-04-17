@@ -15,6 +15,11 @@ CORS(app)
 # Configuración de la base de datos
 DATABASE = 'agroia.db'
 
+@app.route('/', methods=['GET'])
+def home():
+    """Ruta raiz para verificar que el backend esta activo."""
+    return "Servidor funcionando"
+
 def get_db():
     """Conexión a la base de datos"""
     conn = sqlite3.connect(DATABASE)
