@@ -2,7 +2,7 @@
 -- SQLite Schema
 
 -- Tabla de usuarios con roles
-CREATE TABLE usuarios (
+CREATE TABLE IF NOT EXISTS usuarios (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     nombre VARCHAR(100) NOT NULL,
     correo VARCHAR(100) UNIQUE NOT NULL,
@@ -13,7 +13,7 @@ CREATE TABLE usuarios (
 );
 
 -- Tabla de cultivos
-CREATE TABLE cultivos (
+CREATE TABLE IF NOT EXISTS cultivos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     usuario_id INTEGER NOT NULL,
     nombre VARCHAR(100) NOT NULL,
@@ -31,7 +31,7 @@ CREATE TABLE cultivos (
 );
 
 -- Tabla de alertas
-CREATE TABLE alertas (
+CREATE TABLE IF NOT EXISTS alertas (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     cultivo_id INTEGER NOT NULL,
     tipo_alerta VARCHAR(50) NOT NULL, -- 'Sequía', 'Riesgo de hongo', 'Normal', 'Crítico'
@@ -44,7 +44,7 @@ CREATE TABLE alertas (
 );
 
 -- Tabla de lecturas del sensor (historial)
-CREATE TABLE lecturas (
+CREATE TABLE IF NOT EXISTS lecturas (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     cultivo_id INTEGER NOT NULL,
     humedad DECIMAL(5,2) NOT NULL,
@@ -54,7 +54,7 @@ CREATE TABLE lecturas (
 );
 
 -- Tabla de configuración del sistema
-CREATE TABLE configuracion (
+CREATE TABLE IF NOT EXISTS configuracion (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     clave VARCHAR(50) UNIQUE NOT NULL,
     valor TEXT,
@@ -62,15 +62,15 @@ CREATE TABLE configuracion (
 );
 
 -- Insertar usuario administrador por defecto
-INSERT INTO usuarios (nombre, correo, contrasena, rol) 
+INSERT OR IGNORE INTO usuarios (nombre, correo, contrasena, rol) 
 VALUES ('Administrador', 'admin@agroia.com', 'admin123', 'admin');
 
 -- Insertar usuario cliente de prueba
-INSERT INTO usuarios (nombre, correo, contrasena, rol) 
+INSERT OR IGNORE INTO usuarios (nombre, correo, contrasena, rol) 
 VALUES ('Usuario Demo', 'usuario@agroia.com', 'usuario123', 'cliente');
 
 -- Insertar configuración por defecto
-INSERT INTO configuracion (clave, valor, descripcion)
+INSERT OR IGNORE INTO configuracion (clave, valor, descripcion)
 VALUES 
 ('alertas_email', '1', 'Enviar alertas por email'),
 ('lecturas_intervalo', '5', 'Intervalo de lecturas en minutos'),

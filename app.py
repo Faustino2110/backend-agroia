@@ -13,7 +13,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Configuración de la base de datos
-DATABASE = 'agroia.db'
+DATABASE = os.path.join(app.root_path, 'agroia.db')
 
 @app.route('/', methods=['GET'])
 def home():
@@ -30,9 +30,27 @@ def init_db():
     """Inicializar base de datos"""
     with app.app_context():
         db = get_db()
-        with app.open_resource('schema.sql', mode='r') as f:
-            db.cursor().executescript(f.read())
-        db.commit()
+        try:
+            with app.open_resource('schema.sql', mode='r') as f:
+                db.cursor().executescript(f.read())
+            db.commit()
+        finally:
+            db.close()
+
+def ensure_db_ready():
+    """Crear la base de datos si aun no tiene el esquema principal."""
+    db = get_db()
+    try:
+        tablas = db.execute("""
+            SELECT COUNT(*) as total
+            FROM sqlite_master
+            WHERE type = 'table' AND name IN ('usuarios', 'cultivos', 'alertas', 'lecturas')
+        """).fetchone()
+    finally:
+        db.close()
+
+    if int(tablas['total'] or 0) < 4:
+        init_db()
 
 # Decorador para verificar autenticación (simplificado)
 def requiere_auth(f):
@@ -976,6 +994,7 @@ INSTRUCCIONES:
 @app.route('/api/ia/recomendaciones/<int:cultivo_id>', methods=['GET'])
 def recomendaciones_ia(cultivo_id):
     try:
+        ensure_db_ready()
         db = get_db()
         
         cultivo = db.execute(
@@ -1040,9 +1059,18 @@ Genera 3-5 recomendaciones específicas en formato JSON:
             'timestamp': datetime.now().isoformat()
         })
         
+    except sqlite3.Error as e:
+        print(f"Error de base de datos en recomendaciones IA: {e}")
+        return jsonify({
+            'error': 'Error de base de datos al generar recomendaciones',
+            'detalle': str(e),
+            'tipo': 'database_error'
+        }), 500
     except Exception as e:
         print(f"Error en recomendaciones IA: {e}")
         return construir_error_openai(e, 'generar recomendaciones')
+
+ensure_db_ready()
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
